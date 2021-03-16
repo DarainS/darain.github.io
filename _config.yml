@@ -117,4 +117,4 @@ ignore:
 deploy:
   type: git
   repository: https://github.com/DarainS/darain.github.io
-  branch: main
+  branch: pages

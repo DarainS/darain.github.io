@@ -14,7 +14,7 @@ categories:
 
 ## 架构设计
 
-gorm 采用 callback 设计作为数据处理的核心。Callback 本质是切面的编程思想，类似于请求的中间件和 Java 中的 AOP 技术。
+GORM 采用 callback 设计作为数据处理的核心。Callback 本质是一种面向过程的编程思想，类似于请求的中间件和 Java 中的 AOP 技术。
 
 这样做的好处是完全解耦业务逻辑，每一层的 callback 可以完全忽略另一层 callback 的存在，而只处理自己的逻辑。
 
@@ -22,19 +22,19 @@ gorm 采用 callback 设计作为数据处理的核心。Callback 本质是切�
 
 ![20210329164641](https://raw.githubusercontent.com/DarainS/Images/main/images/20210329164641.png)
 
-GORM 将拼接 SQL、执行 SQL、写回结果等操作都放到了 Callback 中。
+GORM 将具体的 DB 做操，如拼接 SQL、执行 SQL、写回结果等操作都放到了 Callback 中。
 
 ## 核心结构体分析
 
 ### *gorm.Scope
 
-Scope 是一次查询的的全局管家，持有本次查询的所有信息。
+Scope 是一次查询的的全局管家，持有本次查询的所有上下文信息，包括 db 连接、结构体信息、查询条件、查询参数、查询结果等。
 其中比较重要的字段有：
 
 - Search：持有所有查询条件，包括 join、group 等。
 - SQLVars：查询的参数
 - Value：传入的结构体
-- db：gorm 自己封装的 DB
+- db：gorm 自己封装的 DB，持有着数据库连接
 
 ```go
 // Scope contain current operation's information when you perform
@@ -266,13 +266,13 @@ func (db *DB) conn(ctx context.Context, strategy connReuseStrategy) (*driverConn
 2. 没有空闲连接，而且不允许获取新连接，阻塞并一直尝试获取连接直到超时
 3. 没有空闲连接，但是允许获取新连接时，获取新连接并返回
 
-当然实际上连接池做的事情并不止这么多，想要详细了解可以参加 [这篇文章](https://www.cnblogs.com/ZhuChangwu/p/13412853.html)。
+当然实际上连接池做的事情并不止这些，想要详细了解可以参加 [Golang SQL连接池梳理](https://www.cnblogs.com/ZhuChangwu/p/13412853.html)。
 
 ### 事务
 
 与连接池类似，gorm 直接复用了 *sql.Tx 来进行事务。
 
-我们前面说了 gorm 的所有 DB 操作都是由 SQLCommon 这个interface 实现的。而这个接口实际上有两个实现：分别为 *sql.DB 和 *sql.Tx。
+我们前面说了 gorm 的所有 DB 操作都是由 SQLCommon 这个 interface 来具体执行的的。而这个接口实际上有两个实现：分别为 *sql.DB 和 *sql.Tx。
 
 其中 *sql.DB 实际上是全局唯一的，即所有 *gorm.DB 果没有开启事务，那么都会由同一个 *sql.DB 来执行。并且由 *sql.DB 来管理连接池。
 
@@ -294,15 +294,54 @@ gorm 通过SQLCommon 屏蔽了底层的 DB 的具体实现，使得事务对其�
 
 ### 主要查询与实现
 
-First 方法
+接下来我们会介绍增删改查等操作的具体流程。
 
-Scan 方法
+都是通过 callback 来实现的，gorm 默认的 callback 可以在 callback.go/DefaultCallback 变量的调用处查看。
 
-Create 方法
+#### First() 方法
 
-Update 方法
+以下是 GORM 进行 First() 查询的核心流程。
 
-Delete 方法
+![20210329202126](https://raw.githubusercontent.com/DarainS/Images/main/images/20210329202126.png)
+
+具体步骤为:
+
+1. 注入结构体 user
+2. 添加查询条件 where...
+3. 调用 callbacks
+
+其中最核心的 callback 为 queryCallback(callback_query.go 文件中)。
+
+这个 Callback 只做了三件事：
+
+1. 拼接 SQL
+2. 执行 SQL
+3. 写回结果
+
+其中拼接 SQL 是调用的是 prepareQuerySQL 方法，scope 会根据之前设置的查询条件和查询参数拼接出可执行的 SQL。
+
+```go
+func (scope *Scope) prepareQuerySQL() {
+	if scope.Search.raw {
+		scope.Raw(scope.CombinedConditionSql())
+	} else {
+		scope.Raw(fmt.Sprintf("SELECT %v FROM %v %v", scope.selectSQL(), scope.QuotedTableName(), scope.CombinedConditionSql()))
+	}
+	return
+}
+```
+
+执行 SQL 则是直接调用 SQLCommon 接口的 Query 方法。
+
+写回结果则是将 DB 返回的列名和数据使用反射写入到存储结果的容器中。
+
+#### Scan() 方法
+
+#### Create() 方法
+
+#### Update() 方法
+
+#### Delete() 方法
 
 SQL 拼接
 
@@ -317,3 +356,15 @@ delete_time 回调
 批量更新
 日志及 CAT
 遇到的其它问题与解决方案
+
+## 参考资料
+1. Golang SQL连接池梳理
+https://www.cnblogs.com/ZhuChangwu/p/13412853.html
+2. Gorm 源码分析(二) 简单query分析
+ https://segmentfault.com/a/1190000019490869
+3. GORM源码阅读与分析
+ https://jiajunhuang.com/articles/2019_03_19-gorm.md.html
+4. Gorm 的 Create 操作 源码分析 https://www.jianshu.com/p/f46518774267
+5. GORM源码解读
+ https://juejin.cn/post/6844904033648394254, https://juejin.cn/post/6844904047774793735
+6. gorm源码解读 https://blog.csdn.net/cexo425/article/details/78831055

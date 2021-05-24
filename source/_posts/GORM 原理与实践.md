@@ -298,7 +298,7 @@ gorm 通过SQLCommon 屏蔽了底层的 DB 的具体实现，使得事务对其�
 
 都是通过 callback 来实现的，gorm 默认的 callback 可以在 callback.go/DefaultCallback 变量的调用处查看。
 
-#### First() 方法
+#### First() 与 Scan() 方法
 
 以下是 GORM 进行 First() 查询的核心流程。
 
@@ -335,36 +335,262 @@ func (scope *Scope) prepareQuerySQL() {
 
 写回结果则是将 DB 返回的列名和数据使用反射写入到存储结果的容器中。
 
-#### Scan() 方法
+Scan() 方法与 First() 方法类似，主要的区别在于 Scan 方法会获取多行结果反射到传入的 slice 中。
 
-#### Create() 方法
+#### 其它 方法
 
-#### Update() 方法
+实际上其它方法的核心与 First() 方法是完全类似的，只是具体细节不同。
+本质上都是分为拼接 SQl，执行 SQL，反射结果三部分。
 
-#### Delete() 方法
+这部分内容偏业务细节，就不再详细阐述了，想要了解可以查看对应的 Callback 代码。
 
-SQL 拼接
+## 团队实践
 
-数据写回
+在使用 gorm 的过程中，我们总结了一些相对有效的实践，在此分享。
 
-介绍这几个函数的流程和核心代码。
+需要注意的是，为了便于阅读，我们将本文贴出的部分代码简化为了伪代码，实际代码会做兼容与边际检查以保证其健壮性，仅提供解决问题的思路，并不建议使用到生产环境。
 
-团队实践
-事务
-delete_time 回调
-批量插入
-批量更新
-日志及 CAT
-遇到的其它问题与解决方案
+### 指导原则
+
+1. 采用 GORM 推荐做法
+2. 降低开发者的心智负担
+3. 显式优于隐式
+
+### 事务
+
+为了降低开发者的心智负担，以及保证代码的健壮性，避免数据库连接泄漏，我们简单封装了 gorm.DB，使得可以简化事务行为。
+
+```go
+type Repo struct {
+	context     context.Context
+	db          *gorm.DB
+}
+
+// 事务代码的封装
+func (s *Repo) WithTransaction(handleFunc  func() error) error {
+    if s.db == nil {
+        s.db = db.GetDB()
+    }
+    //  这里没有兼容
+    tx := s.db.Begin()
+    if tx.Error != nil {
+        return tx.Error
+    }
+    s.db = tx
+	defer func() {
+		if r := recover(); r != nil {
+            // 如果因为 panic 而没有显示调用 Rollback 函数, 会导致 DB 连接泄漏
+			_ = s.Rollback()
+			panic(r)
+		}
+	}()
+
+	err := handleFunc()
+	if err != nil {
+		_ = s.Rollback()
+		return err
+	}
+	// handle ctx timeout
+	if s.Err() != nil {
+		_ = s.Rollback()
+		return s.Err()
+	}
+	err = s.Commit()
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+// 使用事务
+err = r.WithTransaction(func() error {
+    // do something
+    return nil
+})
+```
+
+这种封装使得开发者不再需要显式的 begin、commit、rollback，但要求所有的 DB 操作都必须传入 *Repo，具有比较强的侵入性。
+
+不过这样就不必再显式的操作事务，以及处理嵌套事务的问题，对于新入职的同事比较友好，是一种能够显著降低开发者心智负担的实践。
+
+
+## CTime 和 MTime 的回调
+
+按照部门的规范，所有表都应该尽量带有 ctime 和 mtime 字段。如果需要显示更新的话，一旦忘记就可以认为是代码 bug 了，对开发者十分不友好，所以我们加入了这两个回调。
+
+```go
+// 省略了注册 callback 的代码
+// ...
+// ...
+// updateCtimeAndMtimeForCreateCallback will set `CTime`, `MTime` when creating
+func updateCtimeAndMtimeForCreateCallback(scope *gorm.Scope) {
+    if !scope.HasError() {
+        now := time.Now().Unix()
+        if createdAtField, ok := scope.FieldByName("CTime"); ok {
+			if createdAtField.IsBlank {
+				_ = createdAtField.Set(now)
+			}
+		}
+		if updatedAtField, ok := scope.FieldByName("MTime"); ok {
+			if updatedAtField.IsBlank {
+				_ = updatedAtField.Set(now)
+			}
+		}
+	}
+}
+```
+
+## Delete time 的回调
+
+除了 ctime 和 mtime 之外，我们还有软删除的需求。软删除后不应该再查询出对应的 rows。
+
+我们依然采用了回调的方式来实现，但是这种行为虽然减少了代码量与开发者的心智负担，但是这确实违背了“显式优于隐式”这一原则。特别是对于新入职的同事，如果不知道我们有这种隐含行为，很容易就踩到了坑。
+
+所以我们甚至考虑移除这种回调，只是没有做出最终决定，我们将这种方式分享出来供大家借鉴，希望大家能做出自己的权衡。
+
+
+```go
+// 省略了注册 callback 的代码
+// ...
+func ignoreSoftDeleteItems(scope *gorm.Scope) {
+	if !scope.HasError() {
+        // constant.QueryDeletedRows 是一个字符串常量，用来标记是否查询或更新软删除的数据。所以软删除的数据其实还可以查询出来
+		if val, ok := scope.Get(constant.QueryDeletedRows); ok && val != nil {
+			return
+        }
+        
+        deletedTimeField, hasDeletedTimeField := scope.FieldByName("DeleteTime")
+		if !scope.Search.Unscoped && hasDeletedTimeField {
+			scope.Search.Where(fmt.Sprintf("%s = ?", scope.Quote(deletedTimeField.DBName)), 0)
+		}
+	}
+}
+```
+
+如果想要操作已经软删除的数据的话，使用下面的代码即可：
+
+```go
+db.Set(constant.QueryDeletedRows, true).XXX()
+```
+
+### 批量分批查询
+
+在某些业务场景，我们需要查询出某一个表的所有符合条件数据，所以我们对这种查询进行了封装。
+
+需要特别注意的是，我们要求被查询的表必须具有 int 类型的 `id` 作为唯一键(可以不是主键)，才能够使用这个查询。
+
+
+```go
+// model 是结构体的指针, list 是结构体 slice 的指针
+func QueryAll(query *gorm.DB, model interface{}, list interface{}) (err error) {
+	if reflect.TypeOf(list).Kind() != reflect.Ptr {
+		return exception.ReflectError
+	}
+	var (
+        maxId int64 = 0
+        result []interface{}
+    )
+    for {
+        // queryPageLimit 是一个数字常量, 我们定为 5000
+		err = query.Model(model).Where("id > ?", maxId).Order("id ASC", true).Limit(queryPageLimit).Scan(list).Error
+		if err != nil {
+			return
+		}
+		val := reflect.ValueOf(list)
+		for val.Kind() == reflect.Ptr {
+			val = val.Elem()
+		}
+		for i := 0; i < val.Len(); i++ {
+			result = append(result, val.Index(i).Interface())
+		}
+		if val.Len() < queryPageLimit {
+			break
+        }
+        // 获得最后一个查询结果, 也就是最大的 id
+		lastEle := val.Index(queryPageLimit - 1).Elem()
+		idVal := lastEle.FieldByName("ID")
+		if idVal.IsValid() {
+			maxId = int64(idVal.Uint())
+		} else if idVal = lastEle.FieldByName("Id"); idVal.IsValid() {
+			maxId = int64(idVal.Uint())
+		} else {
+            var maxIds []int64
+            // 如果结构体有 id 字段这里其实不会走到
+			err = query.Model(model).Where("id > ?", maxId).Order("id ASC").Limit(queryPageLimit).Pluck("id", &maxIds).Error
+			if err != nil {
+				return
+			}
+			maxId = maxIds[len(maxIds)-1]
+		}
+    }
+	
+	listVal := reflect.ValueOf(list)
+	listEle := listVal.Elem()
+
+	var isPtr bool
+	// slice 元素的类型
+	if typ.Elem().Elem().Kind() == reflect.Ptr {
+		isPtr = true
+	}
+	toAdd := make([]reflect.Value, 0, len(result))
+	for _, _res := range result {
+		ele := reflect.ValueOf(_res).Elem()
+		if isPtr {
+			toAdd = append(toAdd, ele.Addr())
+		} else {
+			toAdd = append(toAdd, ele)
+		}
+	}
+	listEle.Set(reflect.MakeSlice(listEle.Type(), 0, len(toAdd)))
+	listEle.Set(reflect.Append(listEle, toAdd...))
+	return nil
+}
+...
+
+// 调用方式:
+var (
+    saleOrder SaleOrder
+    saleOrderList []*SaleOrder
+)
+err = db.QueryAll(db.Model(saleOrder).Where("ctime >= ?", 160000000), &saleOrder, &saleOrderList)
+if err != nil {
+    // ...
+}
+// 这里就已经将所有查询结果写入到 saleOrderList 中, 可以使用了
+for _, saleOrder := range saleOrderList {
+    // ...
+}
+```
+
+这段代码有三个不太好的地方，一个是对要查询的表结构和数据库字段有固定的要求，当然如果每个人都遵循团队的数据库设计规范，这个问题并不存在。
+
+第二个地方是，为了保持分片查询的有序性，这段代码在查询时进行了强制的 reorder("id ASC") 操作，使得查询丢失了原有的排序信息。不过我们目前没有在全量查询中必须进行排序，或者说，如果我们需要对查询结果进行排序，那么我们会使用 sort 包来完成，这里影响不大。
+
+另一个地方是它将查询结果又返回给了入参 list。一个参数等于既做了出参又做了入参，这不算是一种良好的编码方式。但是由于 golang 还不支持泛型，为了简化类型约束，便于开发者的使用，不得已而这样写了，算是一种权衡之后的结果。值得一提的是，json.Unmarshal() 方法也采用了这样的入参即出参的方式来简化使用。
+
+### 批量创建
+
+由于 gorm 并未提供批量创建的功能，因此我们写了一个拼接批量创建 SQL 的函数，用于批量创建操作。
+
+### 批量更新
+
+由于 gorm 并未提供批量更新的功能，因此我们使用 IF THEN 控制流，通过主键 id 拼接更新字段的 SQL，完成了批量更新不同数据的功能。
+
+### 监控
+
+通过注册 Callback，我们实现了对 DB 操作的监控。
+
 
 ## 参考资料
 1. Golang SQL连接池梳理
-https://www.cnblogs.com/ZhuChangwu/p/13412853.html
+[https://www.cnblogs.com/ZhuChangwu/p/13412853.html](https://www.cnblogs.com/ZhuChangwu/p/13412853.html
+)
 2. Gorm 源码分析(二) 简单query分析
- https://segmentfault.com/a/1190000019490869
+ [https://segmentfault.com/a/1190000019490869]( https://segmentfault.com/a/1190000019490869
+)
 3. GORM源码阅读与分析
- https://jiajunhuang.com/articles/2019_03_19-gorm.md.html
-4. Gorm 的 Create 操作 源码分析 https://www.jianshu.com/p/f46518774267
+ [https://jiajunhuang.com/articles/2019_03_19-gorm.md.html](https://jiajunhuang.com/articles/2019_03_19-gorm.md.html)
+4. Gorm 的 Create 操作 源码分析 [https://www.jianshu.com/p/f46518774267](https://www.jianshu.com/p/f46518774267)
 5. GORM源码解读
- https://juejin.cn/post/6844904033648394254, https://juejin.cn/post/6844904047774793735
-6. gorm源码解读 https://blog.csdn.net/cexo425/article/details/78831055
+ [https://juejin.cn/post/6844904033648394254](https://juejin.cn/post/6844904033648394254), [https://juejin.cn/post/6844904047774793735](https://juejin.cn/post/6844904047774793735)
+6. gorm源码解读 [https://blog.csdn.net/cexo425/article/details/78831055](https://blog.csdn.net/cexo425/article/details/78831055)
